@@ -1,155 +1,294 @@
-library(tidyverse)
-library(argparse)
+# R program to estimate bottleneck size for BRSV NGS project
+# This code is copied from here:
+https://github.com/weissmanlab/BB_bottleneck/blob/master/Bottleneck_size_estimation_exact.r
+# and adapted to run on our BRSV NGS data. 
+# I also vectorised and parallelised some parts of the code, so it runs about 20x faster.
+# Paul Johnson
+
+rm(list = ls())
+# This code requires use of the R package rmutil 
 library(rmutil)
-# Handle command line arguments first
-
-parser <- ArgumentParser()
-
-parser$add_argument("--file", type="character", default = "./example_data/donor_freqs_recip_freqs_and_reads.txt",
-                    help="file containing variant frequencies and reads")
-parser$add_argument("--plot_bool", type="logical", default= FALSE,
-                    help="determines whether pdf plot exact_plot.pdf is produced or not")
-parser$add_argument("--var_calling_threshold", type="double", default= 0.03,
-                    help="variant calling threshold")
-parser$add_argument("--Nb_min", type="integer", default= 1,
-                    help="Minimum bottleneck value considered")
-parser$add_argument("--Nb_max", type="integer", default= 200,
-                    help="Maximum bottleneck value considered")
-parser$add_argument("--Nb_increment", type="integer", default= 1,
-                    help="increment between Nb values considered, i.e., all values considered will be multiples of Nb_increment that fall between Nb_min and Nb_max")
-parser$add_argument("--confidence_level", type="double", default= .95,
-                    help="Confidence level (determines bounds of confidence interval)")
-args <- parser$parse_args()
-if (args$file == "no_input_return_error" ) { stop("file with lists of donor and recipient frequencies is a required argument.", call.=FALSE)}
-
-plot_bool  <- args$plot_bool # determines whether or not a plot of log likelihood vs bottleneck size is produced
-var_calling_threshold  <- args$var_calling_threshold # variant calling threshold for frequency in recipient
-Nb_min <-  args$Nb_min     # Minimum bottleneck size we consider
-if(Nb_min < 1){Nb_min = 1} # preventing erros with Nb_min at 0 or lower 
-Nb_max <- args$Nb_max      # Maximum bottlebeck size we consider
-Nb_increment <- args$Nb_increment
-confidence_level <- args$confidence_level  # determines width of confidence interval
-donor_freqs_recip_freqs_and_reads_observed <- read.table(args$file)  #table of SNP frequencies and reads in donor and recipient
-
-donor_freqs_recip_freqs_and_reads_observed[,1] = as.numeric(donor_freqs_recip_freqs_and_reads_observed[,1])
-donor_freqs_recip_freqs_and_reads_observed[,2] = as.numeric(donor_freqs_recip_freqs_and_reads_observed[,2])
-donor_freqs_recip_freqs_and_reads_observed[,3] = as.numeric(donor_freqs_recip_freqs_and_reads_observed[,3])
-donor_freqs_recip_freqs_and_reads_observed[,4] = as.numeric(donor_freqs_recip_freqs_and_reads_observed[,4])
+library(argparse)
+library(mdatools)
+library(parallel)
+library(openxlsx)
 
 
-original_row_count <- nrow(donor_freqs_recip_freqs_and_reads_observed) # number of rows in raw table
-donor_freqs_recip_freqs_and_reads_observed <- subset(donor_freqs_recip_freqs_and_reads_observed, donor_freqs_recip_freqs_and_reads_observed[, 1] >= var_calling_threshold)
+# minimum coverage
+cov.thresh <- 500
 
-donor_freqs_recip_freqs_and_reads_observed <- subset(donor_freqs_recip_freqs_and_reads_observed, donor_freqs_recip_freqs_and_reads_observed[, 1] <= (1 - var_calling_threshold))
+# which experiment, G or O
+expt <- "O" 
 
+# mismatch proportions below this threshold are set to zero
+err.thresh <- 0.01
 
-new_row_count <- nrow(donor_freqs_recip_freqs_and_reads_observed) # number of rows in filtered table
+# drop sites that differ at consensus level, to ask to what extent
+# is any relationship between genetic and transmission dependent on
+# consensus differences as opposed to sub-consensus diversity
+drop.consensus.differences <- TRUE
 
-if(new_row_count != original_row_count )
-{print("WARNING:  Rows of the input file with donor frequency less than variant calling threshold have been removed during analysis. ")}
-
-
-donor_freqs_observed <-as.data.frame(donor_freqs_recip_freqs_and_reads_observed[,1])
-n_variants <- nrow(donor_freqs_recip_freqs_and_reads_observed)
-recipient_total_reads <- as.data.frame(donor_freqs_recip_freqs_and_reads_observed[,3]) #read.table(args[2])
-recipient_var_reads_observed <- as.data.frame(donor_freqs_recip_freqs_and_reads_observed[,4])#read.table(args[3])
-
+start.time <- Sys.time()
 
 
-freqs_tibble <- tibble(donor_freqs = donor_freqs_recip_freqs_and_reads_observed[,1], 
-                       recip_total_reads = donor_freqs_recip_freqs_and_reads_observed[,3],  
-                       recip_var_reads = donor_freqs_recip_freqs_and_reads_observed[,4] )
+# define functions
 
+##########################################################################
+##########################################################log_likelihood_function <- matrix( 0, Nb_max)
 
-Log_Beta_Binom <- function(nu_donor, recip_total_reads, recip_var_reads, NB_SIZE)  # This function gives Log Likelihood for every SNP 
-{ LL_val_above <- 0 # used for recipient reads above calling threshold
-  LL_val_below <- 0 # used for recipient reads below calling threshold
+erfinv <- function(x) qnorm((x + 1)/2)/sqrt(2)
+
+generate_log_likelihood_exact <- function(donor_freqs_observed, recipient_total_reads, 
+                                          recipient_var_reads_observed, Nb_val, var_calling_threshold, n_variants) {
+  likelihood_vector <- rep(0, n_variants)
+  log_likelihood_vector <- rep(0, n_variants)
   
+  nu_donor <- donor_freqs_observed[, 1]
+  variant_reads <- recipient_var_reads_observed[, 1]
+  total_reads <- recipient_total_reads[, 1] 
+  vr.gt <- (variant_reads >= var_calling_threshold*total_reads)
+  # implement variant calling threshold
+  for (k in 0:Nb_val){  
+    alpha <- k
+    beta <- (Nb_val - k)
+    if (alpha == 0)
+    { alpha <- 0.00001 }
+    if (beta == 0)
+    { beta <- 0.00001 }
+    m <- alpha/(alpha + beta)
+    s <- (alpha + beta)
+    likelihood_vector[vr.gt] <- likelihood_vector[vr.gt] + 
+      (dbetabinom( variant_reads[vr.gt], total_reads[vr.gt], m, s, log = FALSE)*dbinom(k, size=Nb_val, prob= nu_donor[vr.gt])) 
+  }
+  log_likelihood_vector[vr.gt] = log(likelihood_vector[vr.gt])  
   
+  # implement variant calling threshold
+  likelihood_vector[!vr.gt] = 0
+  log_likelihood_vector[!vr.gt] = 0
+  for (k in 0:Nb_val){  
+    alpha <- k
+    beta <- (Nb_val - k)	
+    if (alpha == 0)
+    { alpha <- 0.00001 }
+    if (beta == 0)
+    { beta <- 0.00001 }
+    m <- alpha/(alpha + beta)
+    s <- (alpha + beta)
+    likelihood_vector[!vr.gt] <- likelihood_vector[!vr.gt] + 
+      (pbetabinom( floor(var_calling_threshold*total_reads[!vr.gt]), total_reads[!vr.gt], m, s)*dbinom(k, size=Nb_val, prob= nu_donor[!vr.gt])) 
+  }
+  log_likelihood_vector[!vr.gt] = log(likelihood_vector[!vr.gt])
+  # Now we sum over log likelihoods of the variants at different loci to get the total log likelihood for each value of Nb
+  #      log_likelihood_function[Nb_val] <- log_likelihood_function[Nb_val] + log_likelihood_matrix[,j]
   
-  nu_donor <- if_else(recip_var_reads <=  recip_total_reads*(1 - var_calling_threshold) , nu_donor,  1-nu_donor )
-  
-  recip_var_reads <- if_else(recip_var_reads <=  recip_total_reads*(1 - var_calling_threshold) , recip_var_reads ,  recip_total_reads- recip_var_reads) 
-  
-  
-  for(k in 0:NB_SIZE){
-  alpha <- k + 10^-9
-  beta <- (NB_SIZE - k) + 10^-9
-  m <- alpha/(alpha + beta)
-  s <- (alpha + beta)
-  
-  LL_val_above <-  LL_val_above + dbetabinom( recip_var_reads, recip_total_reads, m, s)*dbinom(k, size=NB_SIZE, prob= nu_donor)
-  
-  LL_val_below <- LL_val_below + pbetabinom( floor(var_calling_threshold*recip_total_reads), recip_total_reads, m, s)*dbinom(k, size=NB_SIZE, prob= nu_donor)
-}
-
-LL_val <- if_else(recip_var_reads >=  var_calling_threshold*recip_total_reads , LL_val_above,  LL_val_below )
-
-# We use LL_val_above above the calling threshold, and LL_val_below below the calling threshold
-
-LL_val <- log(LL_val) # convert likelihood to log likelihood
-return(LL_val)
+  #  return(log_likelihood_function)
+  sum(log_likelihood_vector)
 }
 
 
-LL_func_approx <- function(Nb_size){  # This function sums over all SNP frequencies in the donor and recipient
-  Total_LL <- 0
-  LL_array <- Log_Beta_Binom(freqs_tibble$donor_freqs, freqs_tibble$recip_total_reads, freqs_tibble$recip_var_reads, Nb_size)  
-  Total_LL <- sum(LL_array)
-  return(Total_LL)
+generate_log_likelihood_function_exact <- 
+  function(donor_freqs_observed, recipient_total_reads, recipient_var_reads_observed, Nb_range, var_calling_threshold, confidence_level = 0.95, n_variants) {
+    #num_NB_values <- length(Nb_range)
+    log_likelihood_function <-
+      unlist(mclapply(Nb_range, function(Nb_val, ...) {
+        print(Nb_val)
+        generate_log_likelihood_exact(donor_freqs_observed, recipient_total_reads, recipient_var_reads_observed, Nb_val, var_calling_threshold, n_variants)
+      }, mc.cores = detectCores()))
+    #  return(log_likelihood_function)
+    return(log_likelihood_function)
+  }
+
+
+#generate_log_likelihood_exact(donor_freqs_observed, recipient_total_reads, recipient_var_reads_observed, Nb_val = 1, var_calling_threshold)
+#generate_log_likelihood_exact(donor_freqs_observed, recipient_total_reads, recipient_var_reads_observed, Nb_val = 200, var_calling_threshold)
+
+
+restrict_log_likelihood <- function(log_likelihood_function, Nb_min, Nb_max) { # restricts log likelihood to the interval of interest 
+  for (h in 1:(Nb_min )){  
+    if(h< Nb_min)
+    {log_likelihood_function[h] = - 999999999}	      # kludge for ensuring that these values less than Nb_min don't interfere with our search for the max of log likelihood in the interval of Nb_min to Nb_max
+  }
+  
+  return(log_likelihood_function)
+  #print(erfinv(percent_confidence_interval)*sqrt(2))
 }
 
-# Now we define array of Log Likelihoods for all possible bottleneck sizes
-bottleneck_values_vector <- c()
-for ( i in Nb_min:Nb_max)
-{  if(i%%Nb_increment == 0) {bottleneck_values_vector <- c(bottleneck_values_vector,i)}
+
+
+
+return_bottleneck_size <- function(log_likelihood_function, Nb_range) { 
+  return(Nb_range[log_likelihood_function == max(log_likelihood_function)])
+}
+
+return_CI <- 
+  function(log_likelihood_function, Nb_range, confidence_level = 0.95) { ## returns lower bound of confidence interval 
+    max_log_likelihood = return_bottleneck_size(log_likelihood_function, Nb_range)  ## This is the point on the x-axis (bottleneck size) at which log likelihood is maximized
+    max_val =  max(log_likelihood_function)  ## This is the maximum value of the log likelihood function, found when the index is our bottleneck estimate
+    CI_height = max_val - erfinv(confidence_level)*sqrt(2)  # This value (  height on y axis) determines the confidence intervals using the likelihood ratio test
+    Nb_range_lo <- Nb_range[Nb_range <= max_log_likelihood]
+    Nb_range_hi <- Nb_range[Nb_range >= max_log_likelihood]
+    CI_lo <-
+      Nb_range_lo[order(abs(log_likelihood_function[Nb_range <= max_log_likelihood] - CI_height))][1]
+    CI_hi <-
+      Nb_range_hi[order(abs(log_likelihood_function[Nb_range >= max_log_likelihood] - CI_height))][1]
+    c(CI_lo, CI_hi)
+  }
+
+############################################################
+############################################################
+
+# load data donor & recipient data 
+
+# path to experiment
+expt.path <- 
+  paste0("~/OneDrive - University of Glasgow/Projects/BRSVtransmission/NGSdata/", expt, "/")
+
+# list of NGS sample names
+file.tab <- file.info(list.files(expt.path, full.names = TRUE))
+sample.list <- sapply(strsplit(rownames(file.tab)[file.tab$isdir], "//"), "[[", 2)
+
+##### restrict to Paper 1 sequences #####
+metadata.all <-
+  read.xlsx("~/Dropbox/projects/BRSVtransmission/BRSV_NGS_metadata/BRSV_NGS_project_metadata_2021-12-01.xlsx",
+            sheet = 1)
+sample.list <- sample.list[sample.list %in% metadata.all$Sequence[metadata.all$Paper1 %in% "In"]]
+
+# restrict to NGS sequences that have produced diversity data (mpile_div.txt file)
+mpile.list <- paste0(expt.path, sample.list, "/", sample.list,"_mpile_div.txt")
+sample.list <- sample.list[file.exists(mpile.list)]
+mpile.list <- mpile.list[file.exists(mpile.list)]
+
+# make table of all pairs of sequences
+all.pairs <- expand.grid(donor = sample.list, recip = sample.list, stringsAsFactors = FALSE)
+all.pairs <- all.pairs[all.pairs$donor != all.pairs$recip, ]
+dim(all.pairs)
+
+# loop over all pairs
+res.tab <- sapply(1:nrow(all.pairs), function(r) {
+  print(r)
+  print(all.pairs[r, ])
+  donor <- all.pairs$donor[r] # "G_7971BALd7_S13aa" # donor sequence
+  donor.file <- paste0(expt.path, donor, "/", donor,"_mpile_div.txt")
+  if(!file.exists(donor.file)) return(NULL)
+  donor.data <- read.delim(donor.file)
+  dim(donor.data)
+  
+  recip <- all.pairs$recip[r] # "G_2078BALd7_S3"
+  recip.file <- paste0(expt.path, recip, "/", recip,"_mpile_div.txt")
+  if(!file.exists(recip.file)) return(NULL)
+  recip.data <- read.delim(recip.file)
+  dim(recip.data)
+  
+  print(c(nrow(donor.data), nrow(recip.data)))
+  if(nrow(donor.data) != nrow(recip.data)) return(c(bottleneck_size = NA, CIlo = NA, CIhi = NA))
+
+  # derive consensus sequences
+  actg <- c("A", "C", "G", "T")
+  donor.data$consensus <- actg[apply(donor.data[, actg], 1, which.max)]
+  recip.data$consensus <- actg[apply(recip.data[, actg], 1, which.max)]
+  consensus.diff <- donor.data$consensus != recip.data$consensus
+  print(paste(sum(consensus.diff), "consensus differences"))
+  
+  # optionally, ignore sites where there are consensus-level differences
+  if(drop.consensus.differences) {
+    donor.data <- donor.data[consensus.diff, ]
+    recip.data <- recip.data[consensus.diff, ]
+  }
+  dim(donor.data)
+  dim(recip.data)
+
+  donor_freqs_recip_freqs_and_reads_observed <-
+    data.frame(V1 = donor.data$Mismatch, 
+               V2 = recip.data$Mismatch, 
+               V3 = recip.data$BaseCov, 
+               V4 = recip.data$NonRefN,
+               V5 = donor.data$BaseCov, 
+               V6 = donor.data$NonRefN)
+  
+  if(mean(donor_freqs_recip_freqs_and_reads_observed$V3) < cov.thresh |
+     quantile(donor_freqs_recip_freqs_and_reads_observed$V3, 0.1) < cov.thresh/4 |
+     mean(donor_freqs_recip_freqs_and_reads_observed$V5) < cov.thresh |
+     quantile(donor_freqs_recip_freqs_and_reads_observed$V5, 0.1) < cov.thresh/4) {
+    return(c(bottleneck_size = NA, CIlo = NA, CIhi = NA))
+  }
+
+  plot_bool  <- TRUE # args$plot_bool
+  var_calling_threshold  <- err.thresh # args$var_calling_threshold
+  Nb_step <- 1
+  Nb_min <- 1 # args$Nb_min
+  Nb_max <- 1000 # args$Nb_max
+  Nb_range <- seq(Nb_min, Nb_max, by = Nb_step)
+  #donor_freqs_recip_freqs_and_reads_observed <- read.table("example_data/donor_freqs_recip_freqs_and_reads.txt")# read.table(args$file)
+  #donor_freqs_recip_freqs_and_reads_observed <- read.table("brsv_data/G_7971BALd7_S13aa-G_2078BALd7_S3.txt")# read.table(args$file)
+  dim(donor_freqs_recip_freqs_and_reads_observed)
+  donor_freqs_recip_freqs_and_reads_observed <- 
+    donor_freqs_recip_freqs_and_reads_observed[donor_freqs_recip_freqs_and_reads_observed$V1 >= var_calling_threshold, ]
+  dim(donor_freqs_recip_freqs_and_reads_observed)
+  apply(donor_freqs_recip_freqs_and_reads_observed[, 1:2], 2, function(x) (which(x > var_calling_threshold)))
+  donor_freqs_observed <- as.data.frame(donor_freqs_recip_freqs_and_reads_observed[,1])
+  n_variants <- nrow(donor_freqs_recip_freqs_and_reads_observed)
+  recipient_total_reads <- as.data.frame(donor_freqs_recip_freqs_and_reads_observed[,3]) #read.table(args[2])
+  recipient_var_reads_observed <- as.data.frame(donor_freqs_recip_freqs_and_reads_observed[,4])#read.table(args[3])
   
   
-}
+  
+  log_likelihood_function <- generate_log_likelihood_function_exact(donor_freqs_observed, recipient_total_reads, recipient_var_reads_observed, Nb_range, var_calling_threshold, confidence_level = 0.95, n_variants)
+  
+  #log_likelihood_function <- restrict_log_likelihood(log_likelihood_function, Nb_range)
+  bottleneck_size <- return_bottleneck_size(log_likelihood_function,  Nb_range)
+  CI_index <- return_CI(log_likelihood_function,  Nb_range)
+  
+  ##########################
+  ##############################################################################################  ABOVE THIS LINE DETERMINES PEAK LOG LIKELIHOOD AND CONFIDENCE INTERVALS
+  # Now we plot the result
+  if(plot_bool == TRUE) {
+    pdf(file=paste0(donor, "to", recip, "exact_plot.pdf"))
+    plot(Nb_range, log_likelihood_function, type = "b", xlab = expression(N[b]), ylab = "log likelihood", cex = 0.6)
+    abline(v = bottleneck_size, col="black", lty = 2)  # Draws a verticle line at Nb value for which log likelihood is maximized
+    abline(v = CI_index, col="green", lty = 2) # confidence intervals
+    mtext(c(bottleneck_size, CI_index), side = 1, at = c(bottleneck_size, CI_index), line = -1)
+    title("Log likelihood of bottleneck size, showing ML estimate with 95% CI")
+    mtext(paste("Variant calling threshold:", var_calling_threshold), side = 3, line = 0.5)
+    dev.off()
+  }
+  
+  print(Sys.time() - start.time)
+  print(paste("Bottleneck size", donor, "to", recip))
+  print(bottleneck_size)
+  print("confidence interval left bound")
+  print(CI_index[1])
+  print("confidence interval right bound")
+  print(CI_index[2])
+  
+  c(bottleneck_size = bottleneck_size, CIlo = CI_index[1], CIhi = CI_index[2])
+})
 
-LL_tibble <- tibble(bottleneck_size = bottleneck_values_vector, Log_Likelihood = 0*bottleneck_values_vector) 
-for(I in 1:nrow(LL_tibble) )
-{LL_tibble$Log_Likelihood[I] <- LL_func_approx( LL_tibble$bottleneck_size[I] ) }
+print(Sys.time() - start.time)
 
 
-# Now we find the maximum likelihood estimate and the associated confidence interval
+all.pairs.res <- na.omit(cbind(all.pairs, t(res.tab)))
 
-Max_LL <- max(LL_tibble$Log_Likelihood) # Maximum value of log likelihood
-Max_LL_bottleneck_index <- which(LL_tibble$Log_Likelihood == max(LL_tibble$Log_Likelihood) ) # bottleneck size at which max likelihood occurs
-Max_LL_bottleneck <- bottleneck_values_vector[Max_LL_bottleneck_index] 
-likelihood_ratio <- qchisq(confidence_level, df=1) # necessary ratio of likelihoods set by confidence level
-ci_tibble <- filter(LL_tibble, 2*(Max_LL - Log_Likelihood) <= likelihood_ratio ) 
-lower_CI_bottleneck <- min(ci_tibble$bottleneck_size)#-1 # lower bound of confidence interval
-upper_CI_bottleneck <- max(ci_tibble$bottleneck_size)#+1 # upper bound of confidence interval
 
-#if ci_tibble is empty
-if (length(ci_tibble$Log_Likelihood) == 0) {
-  lower_CI_bottleneck <- min(Max_LL_bottleneck) 
-  upper_CI_bottleneck <- max(Max_LL_bottleneck)
-}
-if(max(Max_LL_bottleneck) == max(bottleneck_values_vector))
-{upper_CI_bottleneck <- max(bottleneck_values_vector)
-print("Peak bottleneck value for MLE is at Nb_max (or largest possible value given Nb_increment)!  Try raising Nb_max for better bottleneck estimate")
-}
-if(min(Max_LL_bottleneck) == min(bottleneck_values_vector))
-{lower_CI_bottleneck <- min(bottleneck_values_vector)
-if(min(bottleneck_values_vector) > 1){print("Peak bottleneck value for MLE is at Nb_min (or smallest possible value given Nb_increment)!  Try lowering Nb_min for better bottleneck estimate")}
-}
+sample.list
+all.pairs.res[intersect(grep("G_BRSVSweden620p4", all.pairs.res$donor), grep("G_7960BALd7", all.pairs.res$recip)), ]
+all.pairs.res[intersect(grep("G_BRSVSweden620p4", all.pairs.res$donor), grep("G_2035BALd7", all.pairs.res$recip)), ]
+all.pairs.res[intersect(grep("G_7971BALd7", all.pairs.res$donor), grep("G_2073BALd7", all.pairs.res$recip)), ]
+all.pairs.res[intersect(grep("G_7971BALd7", all.pairs.res$donor), grep("G_2078BALd7", all.pairs.res$recip)), ]
+all.pairs.res[intersect(grep("G_7971BALd7", all.pairs.res$donor), grep("G_7992BALd7", all.pairs.res$recip)), ]
 
-# now we plot our results
-if(plot_bool == TRUE){
-  ggplot(data = LL_tibble) + geom_point(aes(x = bottleneck_size, y= Log_Likelihood )) + 
-    geom_vline(xintercept= Max_LL_bottleneck )  + 
-    geom_vline(xintercept= lower_CI_bottleneck, color = "green" ) +
-    geom_vline(xintercept= upper_CI_bottleneck, color = "green" ) + 
-    labs(x= "Bottleneck Size", y = "Log Likelihood" )
-  ggsave("exact_plot.jpg")
-}
-print("Bottleneck size")
-if(length(Max_LL_bottleneck) > 1){print("MLE is degenerate.  The best bottleneck values are")}
-print(Max_LL_bottleneck)
-print("confidence interval left bound")
-print(lower_CI_bottleneck)
-print("confidence interval right bound")
-print(upper_CI_bottleneck)
+write.csv(all.pairs.res, 
+          file = paste0(expt, ifelse(drop.consensus.differences, 
+                                     "_noconsensus", ""), 
+                        "_bottleneck_size.csv"),
+          row.names = FALSE)
 
+# how similar are bottlenecks in opposite directions?
+all.pairs.res$unidirectional <- 
+  apply(apply(all.pairs.res[, c("donor", "recip")], 1, sort), 2, paste, collapse = "-")
+x <- all.pairs.res$bottleneck_size[!duplicated(all.pairs.res$unidirectional)]
+names(x) <- all.pairs.res$unidirectional[!duplicated(all.pairs.res$unidirectional)]
+y <- all.pairs.res$bottleneck_size[duplicated(all.pairs.res$unidirectional)]
+names(y) <- all.pairs.res$unidirectional[duplicated(all.pairs.res$unidirectional)]
+plot(jitter(x), jitter(y[names(x)]), log = "xy")
+cor(x, y[names(x)], method = "spearman")
+abline(0, 1)
