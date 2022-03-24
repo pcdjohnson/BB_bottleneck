@@ -1,15 +1,13 @@
 # R program to estimate bottleneck size for BRSV NGS project
-# This code is copied from here:
-https://github.com/weissmanlab/BB_bottleneck/blob/master/Bottleneck_size_estimation_exact.r
-# and adapted to run on our BRSV NGS data. 
-# I also vectorised and parallelised some parts of the code, so it runs about 20x faster.
+# This code is adapted from:
+# https://github.com/weissmanlab/BB_bottleneck/blob/master/Bottleneck_size_estimation_exact.r
+# I also vectorised and parallelised the functions parts of the code, so it runs about 20x faster on 8 cores.
+# The input data for this project are a metadata xlsx file with data on each sequence, and
+# NGS diversity data output by VSensus (https://github.com/rjorton/VSensus).
 # Paul Johnson
 
 rm(list = ls())
-# This code requires use of the R package rmutil 
 library(rmutil)
-library(argparse)
-library(mdatools)
 library(parallel)
 library(openxlsx)
 
@@ -17,8 +15,8 @@ library(openxlsx)
 # minimum coverage
 cov.thresh <- 500
 
-# which experiment, G or O
-expt <- "O" 
+# analyse experiment G or the outbreak samples O?
+expt <- "G" 
 
 # mismatch proportions below this threshold are set to zero
 err.thresh <- 0.01
@@ -26,15 +24,12 @@ err.thresh <- 0.01
 # drop sites that differ at consensus level, to ask to what extent
 # is any relationship between genetic and transmission dependent on
 # consensus differences as opposed to sub-consensus diversity
-drop.consensus.differences <- TRUE
+drop.consensus.differences <- FALSE
 
 start.time <- Sys.time()
 
 
 # define functions
-
-##########################################################################
-##########################################################log_likelihood_function <- matrix( 0, Nb_max)
 
 erfinv <- function(x) qnorm((x + 1)/2)/sqrt(2)
 
@@ -58,7 +53,7 @@ generate_log_likelihood_exact <- function(donor_freqs_observed, recipient_total_
     m <- alpha/(alpha + beta)
     s <- (alpha + beta)
     likelihood_vector[vr.gt] <- likelihood_vector[vr.gt] + 
-      (dbetabinom( variant_reads[vr.gt], total_reads[vr.gt], m, s, log = FALSE)*dbinom(k, size=Nb_val, prob= nu_donor[vr.gt])) 
+      (dbetabinom( variant_reads[vr.gt], total_reads[vr.gt], m, s, log = FALSE)*dbinom(k, size=Nb_val, prob= nu_donor[vr.gt]))
   }
   log_likelihood_vector[vr.gt] = log(likelihood_vector[vr.gt])  
   
@@ -75,33 +70,23 @@ generate_log_likelihood_exact <- function(donor_freqs_observed, recipient_total_
     m <- alpha/(alpha + beta)
     s <- (alpha + beta)
     likelihood_vector[!vr.gt] <- likelihood_vector[!vr.gt] + 
-      (pbetabinom( floor(var_calling_threshold*total_reads[!vr.gt]), total_reads[!vr.gt], m, s)*dbinom(k, size=Nb_val, prob= nu_donor[!vr.gt])) 
+      (pbetabinom( floor(var_calling_threshold*total_reads[!vr.gt]), total_reads[!vr.gt], m, s)*dbinom(k, size=Nb_val, prob= nu_donor[!vr.gt]))
   }
   log_likelihood_vector[!vr.gt] = log(likelihood_vector[!vr.gt])
   # Now we sum over log likelihoods of the variants at different loci to get the total log likelihood for each value of Nb
-  #      log_likelihood_function[Nb_val] <- log_likelihood_function[Nb_val] + log_likelihood_matrix[,j]
-  
-  #  return(log_likelihood_function)
   sum(log_likelihood_vector)
 }
 
 
 generate_log_likelihood_function_exact <- 
   function(donor_freqs_observed, recipient_total_reads, recipient_var_reads_observed, Nb_range, var_calling_threshold, confidence_level = 0.95, n_variants) {
-    #num_NB_values <- length(Nb_range)
     log_likelihood_function <-
       unlist(mclapply(Nb_range, function(Nb_val, ...) {
         print(Nb_val)
         generate_log_likelihood_exact(donor_freqs_observed, recipient_total_reads, recipient_var_reads_observed, Nb_val, var_calling_threshold, n_variants)
       }, mc.cores = detectCores()))
-    #  return(log_likelihood_function)
     return(log_likelihood_function)
   }
-
-
-#generate_log_likelihood_exact(donor_freqs_observed, recipient_total_reads, recipient_var_reads_observed, Nb_val = 1, var_calling_threshold)
-#generate_log_likelihood_exact(donor_freqs_observed, recipient_total_reads, recipient_var_reads_observed, Nb_val = 200, var_calling_threshold)
-
 
 restrict_log_likelihood <- function(log_likelihood_function, Nb_min, Nb_max) { # restricts log likelihood to the interval of interest 
   for (h in 1:(Nb_min )){  
@@ -110,10 +95,7 @@ restrict_log_likelihood <- function(log_likelihood_function, Nb_min, Nb_max) { #
   }
   
   return(log_likelihood_function)
-  #print(erfinv(percent_confidence_interval)*sqrt(2))
 }
-
-
 
 
 return_bottleneck_size <- function(log_likelihood_function, Nb_range) { 
@@ -167,13 +149,13 @@ dim(all.pairs)
 res.tab <- sapply(1:nrow(all.pairs), function(r) {
   print(r)
   print(all.pairs[r, ])
-  donor <- all.pairs$donor[r] # "G_7971BALd7_S13aa" # donor sequence
+  donor <- all.pairs$donor[r]  # donor sequence
   donor.file <- paste0(expt.path, donor, "/", donor,"_mpile_div.txt")
   if(!file.exists(donor.file)) return(NULL)
   donor.data <- read.delim(donor.file)
   dim(donor.data)
   
-  recip <- all.pairs$recip[r] # "G_2078BALd7_S3"
+  recip <- all.pairs$recip[r] 
   recip.file <- paste0(expt.path, recip, "/", recip,"_mpile_div.txt")
   if(!file.exists(recip.file)) return(NULL)
   recip.data <- read.delim(recip.file)
@@ -181,7 +163,7 @@ res.tab <- sapply(1:nrow(all.pairs), function(r) {
   
   print(c(nrow(donor.data), nrow(recip.data)))
   if(nrow(donor.data) != nrow(recip.data)) return(c(bottleneck_size = NA, CIlo = NA, CIhi = NA))
-
+  
   # derive consensus sequences
   actg <- c("A", "C", "G", "T")
   donor.data$consensus <- actg[apply(donor.data[, actg], 1, which.max)]
@@ -190,13 +172,13 @@ res.tab <- sapply(1:nrow(all.pairs), function(r) {
   print(paste(sum(consensus.diff), "consensus differences"))
   
   # optionally, ignore sites where there are consensus-level differences
-  if(drop.consensus.differences) {
+  if(drop.consensus.differences && sum(consensus.diff) > 0) {
     donor.data <- donor.data[consensus.diff, ]
     recip.data <- recip.data[consensus.diff, ]
   }
   dim(donor.data)
   dim(recip.data)
-
+  
   donor_freqs_recip_freqs_and_reads_observed <-
     data.frame(V1 = donor.data$Mismatch, 
                V2 = recip.data$Mismatch, 
@@ -211,15 +193,13 @@ res.tab <- sapply(1:nrow(all.pairs), function(r) {
      quantile(donor_freqs_recip_freqs_and_reads_observed$V5, 0.1) < cov.thresh/4) {
     return(c(bottleneck_size = NA, CIlo = NA, CIhi = NA))
   }
-
+  
   plot_bool  <- TRUE # args$plot_bool
   var_calling_threshold  <- err.thresh # args$var_calling_threshold
   Nb_step <- 1
   Nb_min <- 1 # args$Nb_min
   Nb_max <- 1000 # args$Nb_max
   Nb_range <- seq(Nb_min, Nb_max, by = Nb_step)
-  #donor_freqs_recip_freqs_and_reads_observed <- read.table("example_data/donor_freqs_recip_freqs_and_reads.txt")# read.table(args$file)
-  #donor_freqs_recip_freqs_and_reads_observed <- read.table("brsv_data/G_7971BALd7_S13aa-G_2078BALd7_S3.txt")# read.table(args$file)
   dim(donor_freqs_recip_freqs_and_reads_observed)
   donor_freqs_recip_freqs_and_reads_observed <- 
     donor_freqs_recip_freqs_and_reads_observed[donor_freqs_recip_freqs_and_reads_observed$V1 >= var_calling_threshold, ]
@@ -234,7 +214,6 @@ res.tab <- sapply(1:nrow(all.pairs), function(r) {
   
   log_likelihood_function <- generate_log_likelihood_function_exact(donor_freqs_observed, recipient_total_reads, recipient_var_reads_observed, Nb_range, var_calling_threshold, confidence_level = 0.95, n_variants)
   
-  #log_likelihood_function <- restrict_log_likelihood(log_likelihood_function, Nb_range)
   bottleneck_size <- return_bottleneck_size(log_likelihood_function,  Nb_range)
   CI_index <- return_CI(log_likelihood_function,  Nb_range)
   
@@ -267,15 +246,6 @@ print(Sys.time() - start.time)
 
 
 all.pairs.res <- na.omit(cbind(all.pairs, t(res.tab)))
-
-
-sample.list
-all.pairs.res[intersect(grep("G_BRSVSweden620p4", all.pairs.res$donor), grep("G_7960BALd7", all.pairs.res$recip)), ]
-all.pairs.res[intersect(grep("G_BRSVSweden620p4", all.pairs.res$donor), grep("G_2035BALd7", all.pairs.res$recip)), ]
-all.pairs.res[intersect(grep("G_7971BALd7", all.pairs.res$donor), grep("G_2073BALd7", all.pairs.res$recip)), ]
-all.pairs.res[intersect(grep("G_7971BALd7", all.pairs.res$donor), grep("G_2078BALd7", all.pairs.res$recip)), ]
-all.pairs.res[intersect(grep("G_7971BALd7", all.pairs.res$donor), grep("G_7992BALd7", all.pairs.res$recip)), ]
-
 write.csv(all.pairs.res, 
           file = paste0(expt, ifelse(drop.consensus.differences, 
                                      "_noconsensus", ""), 
